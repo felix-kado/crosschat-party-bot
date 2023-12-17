@@ -1,0 +1,227 @@
+import asyncio
+import logging
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import Message
+from aiogram.utils.markdown import hbold
+from aiogram.filters.command import Command
+
+from sqlalchemy.orm import sessionmaker
+from models import User, Chat, Party, engine
+
+from credentials import TOKEN
+
+Session = sessionmaker(bind=engine)
+
+
+# All handlers should be attached to the Router (or Dispatcher)
+dp = Dispatcher()
+bot = Bot(TOKEN, parse_mode=ParseMode.HTML)
+session = Session()
+
+
+async def is_chat_member(chat_id: int, user_id: int) -> bool:
+    user_status = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+    return user_status.status in ["member", "administrator", "creator"]
+
+
+async def update_user(message: Message) -> list[str]:
+    user = session.query(User).filter(User.user_id == message.from_user.id).first()
+
+    # create new user if it doesn't exist
+    if not user:
+        user = User(user_id=message.from_user.id, name=message.from_user.full_name)
+        session.add(user)
+        session.commit()
+        logging.info(f"User added to the database: {user.user_id}, {user.name}")
+
+    chats = session.query(Chat).all()
+
+    # check all chats and add them to the user if the user is member
+    for chat in chats:
+        if await is_chat_member(chat.chat_id, user.user_id):
+            if chat not in user.chats:
+                user.chats.append(chat)
+                logging.info(
+                    f"Chat added to the user: {user.user_id}, {user.name} -- {chat.chat_id}, {chat.name}"
+                )
+
+    # remove chats from the user if the user is not member anymore
+    for chat in user.chats:
+        if not await is_chat_member(chat.chat_id, user.user_id):
+            user.chats.remove(chat)
+            logging.info(
+                f"User is not member of the chat anymore: {user.user_id}, {user.name} -- {chat.chat_id}, {chat.name}"
+            )
+
+    user_chats = [chat.name for chat in user.chats]
+
+    session.commit()
+
+    return user_chats
+
+
+async def update_chat(message: Message) -> list[str]:
+    chat = session.query(Chat).filter(Chat.chat_id == message.chat.id).first()
+
+    # create new chat if it doesn't exist
+    if not chat:
+        chat = Chat(chat_id=message.chat.id, name=message.chat.title)
+        session.add(chat)
+        session.commit()
+        logging.info(f"Chat added to the database: {chat.chat_id}, {chat.name}")
+
+    # check all users and add them to the chat if the user is member
+    users = session.query(User).all()
+    for user in users:
+        if await is_chat_member(chat.chat_id, user.user_id):
+            if user not in chat.members:
+                chat.members.append(user)
+                session.commit()
+                logging.info(
+                    f"User added to the chat: {chat.chat_id}, {chat.name} -- {user.user_id}, {user.name}"
+                )
+
+    # remove users from the chat if the user is not member anymore
+    for user in chat.members:
+        if not await is_chat_member(chat.chat_id, user.user_id):
+            chat.members.remove(user)
+            session.commit()
+            logging.info(
+                f"User is not member of the chat anymore: {user.user_id}, {user.name} -- {chat.chat_id}, {chat.name}"
+            )
+
+    chat_members = [user.name for user in chat.members]
+
+    return chat_members
+
+
+@dp.message(Command("update"))
+@dp.message(CommandStart())
+async def command_start_handler(message: Message) -> None:
+    # update database for users and chats
+    if message.chat.type == "private":
+        logging.info(
+            f"User {message.from_user.id}, {message.from_user.full_name} updated database"
+        )
+        user_chats = "\n".join(await update_user(message))
+        await bot.send_message(
+            message.chat.id, f"Привет, ты состоишь в чатах:\n{user_chats}!"
+        )
+
+    else:
+        logging.info(f"Chat {message.chat.id}, {message.chat.title} updated database")
+        chat_members = "\n".join(await update_chat(message))
+        await bot.send_message(
+            message.chat.id,
+            f"Привет, вот зарегистрированне пользователи этого чата:\n{chat_members}",
+        )
+
+
+async def create_party_poll(message: types.Message, description: str) -> Party:
+    announcement = await message.answer_poll(
+        question=description,
+        options=["Я пойду", "Я пока не уверен", "Я не пойду"],
+        is_anonymous=False,
+    )
+
+    party = Party(
+        description=description,
+        poll_chat_id=announcement.chat.id,
+        poll_message_id=announcement.message_id,
+    )
+    session.add(party)
+    session.commit()
+    logging.info(
+        f"Party added to the database: {party.description}, {party.poll_chat_id}, {party.poll_message_id}"
+    )
+
+    return party
+
+
+async def notify_users_about_party(party: Party, chat: Chat) -> None:
+    for user in chat.members:
+        if user not in party.notified:
+            await bot.forward_message(
+                chat_id=user.user_id,
+                from_chat_id=party.poll_chat_id,
+                message_id=party.poll_message_id,
+            )
+            logging.info(
+                f"User {user.user_id}, {user.name} was notified about the party {party.party_id}"
+            )
+            party.notified.append(user)
+
+    session.commit()
+
+
+async def check_rules(message: types.Message) -> bool:
+    if message.chat.type == "private":
+        await bot.send_message(
+            message.chat.id, "Нельзя создавать встречи в личных чатах"
+        )
+        logging.error(
+            f"User {message.from_user.id}, {message.from_user.full_name} tried to create a party in private chat"
+        )
+        return False
+
+    description = message.text.split("/party", 1)[1].strip()
+
+    if description == "":
+        await message.answer("Описание не может быть пустым")
+        logging.error(
+            f"User {message.from_user.id}, {message.from_user.full_name} tried to create a party with an empty description"
+        )
+        return False
+    if len(description) >= 300:
+        await message.answer(
+            "В описание опроса нельзя такое длинное описание поместить, попробуй написать лаконичнее"
+        )
+        logging.error(
+            f"User {message.from_user.id} tried to create a party with a too long description"
+        )
+        return False
+
+    return True
+
+
+@dp.message(Command("party"))
+async def handle_party_command(message: types.Message) -> None:
+    if not await check_rules(message):
+        return
+
+    await update_chat(message)
+
+    description = message.text.split("/party", 1)[1].strip()
+    party = session.query(Party).filter(Party.description == description).first()
+
+    if not party:
+        party = await create_party_poll(message, description)
+    else:
+        await bot.forward_message(
+            chat_id=message.chat.id,
+            from_chat_id=party.poll_chat_id,
+            message_id=party.poll_message_id,
+        )
+        logging.info(
+            f"User {message.from_user.id} tried to create a party with an already existing description, used forwarded message"
+        )
+
+    chat = session.query(Chat).filter(Chat.chat_id == message.chat.id).first()
+    await notify_users_about_party(party, chat)
+
+    session.commit()
+
+
+async def main() -> None:
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    asyncio.run(main())
