@@ -19,7 +19,7 @@ class User(Base):
     __tablename__ = 'users'
 
     user_id = Column(Integer, primary_key=True)
-    name = Column(String)
+    full_name = Column(String)
     chats = relationship('Chat', secondary=user_chat_association, back_populates='members')
     notified_parties = relationship('Party', secondary=user_party_association, back_populates='notified')
 
@@ -27,13 +27,15 @@ class Chat(Base):
     __tablename__ = 'chats'
 
     chat_id = Column(Integer, primary_key=True)
-    name = Column(String)
+    title = Column(String)
     members = relationship('User', secondary=user_chat_association, back_populates='chats')
 
 class Party(Base):
     __tablename__ = 'parties'
 
     party_id = Column(Integer, primary_key=True)
+    from_who_name = Column(String)
+    from_who_tg = Column(Integer)
     description = Column(String)
     poll_message_id = Column(Integer)
     poll_chat_id = Column(Integer)

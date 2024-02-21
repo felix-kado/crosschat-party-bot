@@ -7,6 +7,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message
 from aiogram.utils.markdown import hbold
 from aiogram.filters.command import Command
+from aiogram.enums.chat_member_status import ChatMemberStatus
 
 from sqlalchemy.orm import sessionmaker
 from models import User, Chat, Party, engine
@@ -24,7 +25,7 @@ session = Session()
 
 async def is_chat_member(chat_id: int, user_id: int) -> bool:
     user_status = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-    return user_status.status in ["member", "administrator", "creator"]
+    return user_status.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR, ChatMemberStatus.MEMBER)
 
 
 async def update_user(message: Message) -> list[str]:
@@ -32,10 +33,10 @@ async def update_user(message: Message) -> list[str]:
 
     # create new user if it doesn't exist
     if not user:
-        user = User(user_id=message.from_user.id, name=message.from_user.full_name)
+        user = User(user_id=message.from_user.id, full_name=message.from_user.full_name)
         session.add(user)
         session.commit()
-        logging.info(f"User added to the database: {user.user_id}, {user.name}")
+        logging.info(f"User added to the database: {user.user_id}, {user.full_name}")
 
     chats = session.query(Chat).all()
 
@@ -45,7 +46,7 @@ async def update_user(message: Message) -> list[str]:
             if chat not in user.chats:
                 user.chats.append(chat)
                 logging.info(
-                    f"Chat added to the user: {user.user_id}, {user.name} -- {chat.chat_id}, {chat.name}"
+                    f"Chat added to the user: {user.user_id}, {user.full_name} -- {chat.chat_id}, {chat.title}"
                 )
 
     # remove chats from the user if the user is not member anymore
@@ -53,10 +54,10 @@ async def update_user(message: Message) -> list[str]:
         if not await is_chat_member(chat.chat_id, user.user_id):
             user.chats.remove(chat)
             logging.info(
-                f"User is not member of the chat anymore: {user.user_id}, {user.name} -- {chat.chat_id}, {chat.name}"
+                f"User is not member of the chat anymore: {user.user_id}, {user.full_name} -- {chat.chat_id}, {chat.title}"
             )
 
-    user_chats = [chat.name for chat in user.chats]
+    user_chats = [chat.title for chat in user.chats]
 
     session.commit()
 
@@ -68,10 +69,10 @@ async def update_chat(message: Message) -> list[str]:
 
     # create new chat if it doesn't exist
     if not chat:
-        chat = Chat(chat_id=message.chat.id, name=message.chat.title)
+        chat = Chat(chat_id=message.chat.id, title=message.chat.title)
         session.add(chat)
         session.commit()
-        logging.info(f"Chat added to the database: {chat.chat_id}, {chat.name}")
+        logging.info(f"Chat added to the database: {chat.chat_id}, {chat.title}")
 
     # check all users and add them to the chat if the user is member
     users = session.query(User).all()
@@ -81,7 +82,7 @@ async def update_chat(message: Message) -> list[str]:
                 chat.members.append(user)
                 session.commit()
                 logging.info(
-                    f"User added to the chat: {chat.chat_id}, {chat.name} -- {user.user_id}, {user.name}"
+                    f"User added to the chat: {chat.chat_id}, {chat.title} -- {user.user_id}, {user.full_name}"
                 )
 
     # remove users from the chat if the user is not member anymore
@@ -90,10 +91,10 @@ async def update_chat(message: Message) -> list[str]:
             chat.members.remove(user)
             session.commit()
             logging.info(
-                f"User is not member of the chat anymore: {user.user_id}, {user.name} -- {chat.chat_id}, {chat.name}"
+                f"User is not member of the chat anymore: {user.user_id}, {user.full_name} -- {chat.chat_id}, {chat.title}"
             )
 
-    chat_members = [user.name for user in chat.members]
+    chat_members = [user.full_name for user in chat.members]
 
     return chat_members
 
@@ -129,6 +130,8 @@ async def create_party_poll(message: types.Message, description: str) -> Party:
 
     party = Party(
         description=description,
+        from_who_name=message.from_user.full_name,
+        from_who_tg=message.from_user.username,
         poll_chat_id=announcement.chat.id,
         poll_message_id=announcement.message_id,
     )
@@ -144,13 +147,16 @@ async def create_party_poll(message: types.Message, description: str) -> Party:
 async def notify_users_about_party(party: Party, chat: Chat) -> None:
     for user in chat.members:
         if user not in party.notified:
+            await bot.send_message(
+                user.user_id, f"Встреча от {party.from_who_name} (@{party.from_who_tg})\n"
+            )
             await bot.forward_message(
                 chat_id=user.user_id,
                 from_chat_id=party.poll_chat_id,
                 message_id=party.poll_message_id,
             )
             logging.info(
-                f"User {user.user_id}, {user.name} was notified about the party {party.party_id}"
+                f"User {user.user_id}, {user.full_name} was notified about the party {party.party_id}"
             )
             party.notified.append(user)
 
@@ -213,7 +219,25 @@ async def handle_party_command(message: types.Message) -> None:
     await notify_users_about_party(party, chat)
 
     session.commit()
+    
+@dp.message(Command("info"))
+async def handle_party_command(message: types.Message) -> None:
+    await bot.send_message(
+        message.chat.id, """ Привет, я бот для создания встреч. 
 
+Моя задачи: 
+- Уведомлять пользователей о намечающихся встречах
+- Создавать и прокидывать опрос со сбором участников между чатами
+
+Чтобы подписаться на уведомления, просто перейдите в чат с ботом @party_flex_bot и отправьте команду /start.
+
+Для создания опроса о встрече напишите команду /party, за которой следует описание мероприятия в одном сообщении. Например:
+<pre>/party Боулинг в четверг в 13:00. Торговый центр "Маяк"</pre>
+<i>Старайтесь писать небольшое, но исчерпывабщее описание. Пользователь в личке увидит только его.</i>
+
+
+Если вы хотите пригласить участников из другого чата, где также есть этот бот, просто отправьте ту же команду с таким же описанием. Бот передаст уже существующий опрос, а уведомления получат только те пользователи, которых не было в предыдущих встречах."""
+    )
 
 async def main() -> None:
     await dp.start_polling(bot)
